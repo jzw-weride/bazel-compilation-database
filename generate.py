@@ -29,11 +29,28 @@ import subprocess
 import sys
 import tempfile
 
-
 _BAZEL = os.getenv("BAZEL_COMPDB_BAZEL_PATH") or "bazel"
 
 _OUTPUT_GROUPS = "compdb_files,header_files"
 
+_TEMPLATE = """
+## Replace workspace_name and dir_path as per your setup.
+load("@com_grail_bazel_compdb//:defs.bzl", "compilation_database")
+
+compilation_database(
+    name = "compdb",
+    targets = [
+        {TARGETS}
+    ],
+    testonly = True,
+    # OUTPUT_BASE is a dynamic value that will vary for each user workspace.
+    # If you would like your build outputs to be the same across users, then
+    # skip supplying this value, and substitute the default constant value
+    # "__OUTPUT_BASE__" through an external tool like `sed` or `jq` (see
+    # below shell commands for usage).
+    output_base = "{OUTPUT_BASE}",
+)
+"""
 
 def bazel_info():
     """Returns a dict containing key values from bazel info."""
@@ -73,6 +90,9 @@ if __name__ == "__main__":
     bazel_info_dict = bazel_info()
     bazel_exec_root = bazel_info_dict['execution_root']
     bazel_workspace = bazel_info_dict['workspace']
+    bazel_output_base = bazel_info_dict['output_base']
+    bazel_workspace = bazel_info_dict['workspace']
+    workspace_name = bazel_exec_root.split('/')[-1]
     compdb_file = os.path.join(bazel_workspace, "compile_commands.json")
 
     os.chdir(bazel_workspace)
@@ -89,29 +109,29 @@ if __name__ == "__main__":
     targets_file = tempfile.NamedTemporaryFile()
     subprocess.check_call(query_cmd, stdout=targets_file)
 
-    # Clean any previously generated files.
-    for db in pathlib.Path(bazel_exec_root).glob('**/*.compile_commands.json'):
-        db.unlink()
+
+    with open(targets_file.name, 'r') as targets:
+        targets_str =  ",\n".join(map(lambda s: '"@' + workspace_name + s.strip() + '"', targets.readlines()))
+
+    targets_file.close()
+    with open((pathlib.Path(__file__) / ".." / "targets" / "BUILD").resolve().as_posix(), 'w') as o:
+        o.write(_TEMPLATE.format(TARGETS=targets_str, OUTPUT_BASE=bazel_output_base))
 
     build_args = [
-        '--override_repository=bazel_compdb={}'.format(aspects_dir),
-        '--aspects=@bazel_compdb//:aspects.bzl%compilation_database_aspect',
+        '--override_repository=com_grail_bazel_compdb={}'.format(aspects_dir),
         '--noshow_progress',
         '--noshow_loading_progress',
-        '--output_groups={}'.format(_OUTPUT_GROUPS),
-        '--target_pattern_file={}'.format(targets_file.name),
+        '--check_visibility=false',
+        '@com_grail_bazel_compdb//targets:compdb',
     ]
     build_cmd = [_BAZEL, 'build']
     build_cmd.extend(build_args)
-    build_cmd.extend(user_build_args)
     subprocess.check_call(build_cmd, stdout=subprocess.DEVNULL)
 
-    targets_file.close()
-
     db_entries = []
-    for db in pathlib.Path(bazel_exec_root).glob('**/*.compile_commands.json'):
-        with open(db, 'r') as f:
-            db_entries.extend(json.load(f))
+    db_path = pathlib.Path(bazel_workspace) / "bazel-bin/external/com_grail_bazel_compdb/targets/compile_commands.json"
+    with open(db_path.resolve().as_posix(), 'r') as f:
+        db_entries.extend(json.load(f))
 
     def replace_execroot_marker(db_entry):
         if 'directory' in db_entry and db_entry['directory'] == '__EXEC_ROOT__':
